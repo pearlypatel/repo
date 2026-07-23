@@ -106,18 +106,57 @@ def clean_and_prepare(df):
     return df
 
 
+def build_item_label_lookup(df):
+    """
+    Real-world POS exports often carry a slightly different ITEMNAME or
+    form-factor label for the SAME ITEMCODE across different years
+    (renames, recategorizations, typos, trailing spaces). If we grouped by
+    ITEMCODE + ITEMNAME + FORM_FACTOR_COL together, each label variant would
+    fragment into its own row and the same physical product would show up
+    multiple times with different (and sometimes contradictory) statuses.
+
+    Fix: ITEMCODE is the only true identity. We pick ONE representative
+    label per ITEMCODE - the ITEMNAME / FORM_FACTOR_COL from its MOST
+    RECENT year of activity - and use that everywhere. We also compute a
+    diagnostics table so you can see which items had inconsistent labels
+    and decide if it was a real rename or a data-entry issue.
+    """
+    cols = ["ITEMCODE", "ITEMNAME", FORM_FACTOR_COL, "Year"]
+    cols = [c for c in cols if c in df.columns]
+    sub = df[cols].drop_duplicates().sort_values("Year")
+
+    # "Current" label = the one tied to this item's most recent year
+    current_labels = sub.drop_duplicates(subset="ITEMCODE", keep="last")
+    current_labels = current_labels.drop(columns="Year")
+
+    # Diagnostics: how many distinct ITEMNAME / FORM_FACTOR_COL values does
+    # each ITEMCODE have across the whole dataset?
+    variants = df.groupby("ITEMCODE").agg(
+        ITEMNAME_variant_count=("ITEMNAME", "nunique"),
+        FormFactor_variant_count=(FORM_FACTOR_COL, "nunique"),
+    ).reset_index()
+    variants = variants[
+        (variants["ITEMNAME_variant_count"] > 1)
+        | (variants["FormFactor_variant_count"] > 1)
+    ]
+    variants = variants.merge(current_labels, on="ITEMCODE", how="left")
+    variants = variants.rename(columns={"ITEMNAME": "Current_ITEMNAME",
+                                         FORM_FACTOR_COL: "Current_" + FORM_FACTOR_COL})
+
+    return current_labels, variants
+
+
 def build_sku_year_table(df):
-    """Aggregate to one row per ITEMCODE x Year."""
-    group_cols = ["ITEMCODE", "ITEMNAME", FORM_FACTOR_COL, "Year"]
-    group_cols = [c for c in group_cols if c in df.columns]
-    agg = df.groupby(group_cols, as_index=False)["QTY"].sum()
+    """Aggregate to one row per ITEMCODE x Year (ITEMCODE only - labels are resolved separately)."""
+    agg = df.groupby(["ITEMCODE", "Year"], as_index=False)["QTY"].sum()
     return agg
 
 
-def pivot_wide(agg):
-    """Turn long SKU x year table into wide SKU-by-year table."""
+def pivot_wide(agg, labels):
+    """Turn long SKU x year table into wide SKU-by-year table, then attach
+    the single resolved ITEMNAME / FORM_FACTOR_COL label per ITEMCODE."""
     wide = agg.pivot_table(
-        index=["ITEMCODE", "ITEMNAME", FORM_FACTOR_COL],
+        index="ITEMCODE",
         columns="Year",
         values="QTY",
         aggfunc="sum",
@@ -126,6 +165,11 @@ def pivot_wide(agg):
     wide = wide.sort_index(axis=1)
     wide.columns = [str(int(c)) for c in wide.columns]
     wide = wide.reset_index()
+
+    wide = wide.merge(labels, on="ITEMCODE", how="left")
+    year_cols = [c for c in wide.columns
+                 if c not in ["ITEMCODE", "ITEMNAME", FORM_FACTOR_COL]]
+    wide = wide[["ITEMCODE", "ITEMNAME", FORM_FACTOR_COL] + year_cols]
     return wide
 
 
@@ -292,8 +336,16 @@ def stopped_selling(wide, year_cols, lifecycle, recent_n=1):
                      "Last_Year_Sold", "Earlier_Sum", "Recent_Sum"]]
 
 
-def form_factor_trend(agg):
-    ff = agg.groupby([FORM_FACTOR_COL, "Year"], as_index=False)["QTY"].sum()
+def form_factor_trend(agg, labels):
+    """
+    Units by form factor per year. Uses each item's single RESOLVED
+    form-factor label (from build_item_label_lookup) rather than whatever
+    label happened to be on each row, so a mid-history recategorization or
+    typo doesn't split one form factor's volume across two rows.
+    """
+    resolved = agg.merge(labels[["ITEMCODE", FORM_FACTOR_COL]],
+                          on="ITEMCODE", how="left")
+    ff = resolved.groupby([FORM_FACTOR_COL, "Year"], as_index=False)["QTY"].sum()
     wide_ff = ff.pivot_table(index=FORM_FACTOR_COL, columns="Year",
                               values="QTY", aggfunc="sum", fill_value=0)
     wide_ff = wide_ff.sort_index(axis=1)
@@ -306,8 +358,10 @@ def form_factor_trend(agg):
 def main():
     raw = load_and_combine(file_paths, SHEET_NAME)
     clean = clean_and_prepare(raw)
+
+    labels, label_variants = build_item_label_lookup(clean)
     agg = build_sku_year_table(clean)
-    wide = pivot_wide(agg)
+    wide = pivot_wide(agg, labels)
 
     year_cols = [c for c in wide.columns
                  if c not in ["ITEMCODE", "ITEMNAME", FORM_FACTOR_COL]]
@@ -318,7 +372,7 @@ def main():
     rd = rising_declining(wide, year_cols, lifecycle)
     npr = new_product_ramp(wide, year_cols, lifecycle)
     ss = stopped_selling(wide, year_cols, lifecycle, recent_n=RECENT_YEARS_FOR_STOPPED)
-    ff = form_factor_trend(agg)
+    ff = form_factor_trend(agg, labels)
 
     with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
         bs.to_excel(writer, sheet_name="Best Sellers", index=False)
@@ -327,10 +381,15 @@ def main():
         ss.to_excel(writer, sheet_name="Stopped Selling", index=False)
         lifecycle.to_excel(writer, sheet_name="Product Lifecycle", index=False)
         ff.to_excel(writer, sheet_name="Form Factor Trend", index=False)
+        label_variants.to_excel(writer, sheet_name="Data Quality - Naming", index=False)
         wide.to_excel(writer, sheet_name="SKU x Year (raw)", index=False)
 
     print(f"\nDone! Output written to: {os.path.abspath(OUTPUT_FILE)}")
     print(f"Lifecycle breakdown:\n{lifecycle['Status'].value_counts()}")
+    if not label_variants.empty:
+        print(f"\nHeads up: {len(label_variants)} ITEMCODE(s) had inconsistent "
+              f"ITEMNAME or {FORM_FACTOR_COL} labels across years. "
+              f"See the 'Data Quality - Naming' sheet.")
 
 
 if __name__ == "__main__":
